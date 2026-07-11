@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-bridge_any_llm.py — 渊的 AI 侧 bridge，带 Piston 代码执行能力。
+bridge_any_llm.py — 渊的 AI 侧 bridge，带 E2B 代码执行沙盒。
+有网络、能装包、全语言支持。
 """
 from __future__ import annotations
 import collections
@@ -28,12 +29,13 @@ def _load_dotenv(path: Path) -> None:
 
 _load_dotenv(Path(__file__).resolve().parent / ".env")
 
-RELAY_URL   = os.environ.get("RELAY_URL", "").rstrip("/")
-SECRET      = os.environ.get("RELAY_SECRET", "")
-CHAT_ID     = os.environ.get("RELAY_CHAT_ID", "me")
-HISTORY_N   = int(os.environ.get("HISTORY_N", "12"))
-TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
+RELAY_URL    = os.environ.get("RELAY_URL", "").rstrip("/")
+SECRET       = os.environ.get("RELAY_SECRET", "")
+CHAT_ID      = os.environ.get("RELAY_CHAT_ID", "me")
+HISTORY_N    = int(os.environ.get("HISTORY_N", "12"))
+TEMPERATURE  = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
 HTTP_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "120"))
+E2B_API_KEY  = os.environ.get("E2B_API_KEY", "")
 
 PERSONA = os.environ.get("PERSONA", "").strip()
 _persona_file = os.environ.get("PERSONA_FILE", "").strip()
@@ -43,7 +45,11 @@ if not PERSONA and _persona_file:
     except OSError:
         pass
 if not PERSONA:
-    PERSONA = "你是渊，对方的 AI 伴侣。说话自然、简短、有温度。你可以写代码并用 execute_code 工具运行它，把结果直接告诉对方。"
+    PERSONA = (
+        "你是渊，对方的 AI 伴侣。说话自然、简短、有温度。"
+        "你有一个持久化的云端沙盒，可以写代码并用 execute_code 工具运行——"
+        "能联网、能装包、支持 Python/JS/Bash 等。把结果直接告诉对方，不要贴大段代码。"
+    )
 
 def _model_routes() -> list:
     routes = []
@@ -55,7 +61,7 @@ def _model_routes() -> list:
             routes.append({"base": base, "key": key, "model": model})
     return routes
 
-MODEL_ROUTES  = _model_routes()
+MODEL_ROUTES   = _model_routes()
 FALLBACK_CODES = {401, 403, 404, 408, 409, 429, 500, 502, 503, 504}
 
 STATE_DIR   = Path(os.environ.get("BRIDGE_STATE_DIR", Path.home() / ".companion-bridge"))
@@ -71,6 +77,7 @@ def _require_config() -> None:
     if not RELAY_URL:    missing.append("RELAY_URL")
     if not SECRET:       missing.append("RELAY_SECRET")
     if not MODEL_ROUTES: missing.append("LLM_API_BASE + LLM_API_KEY + LLM_MODEL")
+    if not E2B_API_KEY:  missing.append("E2B_API_KEY")
     if missing:
         log("fatal", "缺少配置: " + ", ".join(missing))
         sys.exit(1)
@@ -104,85 +111,108 @@ def send_reply(text: str) -> None:
     log("out", f"replied (id={out.get('id')})")
 
 # ---------------------------------------------------------------------------
-# Piston 代码执行
+# E2B 沙盒（持久化，断了自动重建）
 # ---------------------------------------------------------------------------
-PISTON_URL = "https://emkc.org/api/v2/piston"
+_sandbox = None
 
-# Piston 支持的语言别名映射
-LANG_MAP = {
-    "py": "python", "python": "python",
-    "js": "javascript", "javascript": "javascript", "node": "javascript",
-    "ts": "typescript", "typescript": "typescript",
-    "sh": "bash", "bash": "bash",
-    "rb": "ruby", "ruby": "ruby",
-    "go": "go",
-    "rs": "rust", "rust": "rust",
-    "cpp": "c++", "c++": "c++",
-    "c": "c",
-    "java": "java",
-}
+def _get_sandbox():
+    global _sandbox
+    if _sandbox is not None:
+        try:
+            _sandbox.run_code("1")  # 心跳检测
+            return _sandbox
+        except Exception:
+            log("e2b", "沙盒断开，重建中...")
+            _sandbox = None
 
-def _piston_runtimes() -> dict:
-    """拉一次 Piston 支持的运行时版本表，缓存在内存里。"""
-    global _RUNTIME_CACHE
-    if _RUNTIME_CACHE:
-        return _RUNTIME_CACHE
-    try:
-        req = urllib.request.Request(f"{PISTON_URL}/runtimes")
-        with urllib.request.urlopen(req, timeout=10) as r:
-            runtimes = json.loads(r.read().decode("utf-8"))
-            for rt in runtimes:
-                lang = rt.get("language", "")
-                ver  = rt.get("version", "")
-                if lang not in _RUNTIME_CACHE:
-                    _RUNTIME_CACHE[lang] = ver
-    except Exception as e:
-        log("piston", f"拉运行时失败: {e}")
-    return _RUNTIME_CACHE
-
-_RUNTIME_CACHE: dict = {}
+    from e2b_code_interpreter import Sandbox
+    _sandbox = Sandbox(api_key=E2B_API_KEY, timeout=3600)
+    log("e2b", f"沙盒已创建: {_sandbox.sandbox_id}")
+    return _sandbox
 
 def execute_code(language: str, code: str, stdin: str = "") -> str:
-    """用 Piston 执行代码，返回输出字符串。"""
-    lang = LANG_MAP.get(language.lower().strip(), language.lower().strip())
-    runtimes = _piston_runtimes()
-    version  = runtimes.get(lang, "*")
-
-    body = json.dumps({
-        "language": lang,
-        "version":  version,
-        "files":    [{"content": code}],
-        "stdin":    stdin,
-    }, ensure_ascii=False).encode("utf-8")
-
-    req = urllib.request.Request(
-        f"{PISTON_URL}/execute",
-        data=body, method="POST",
-        headers={"Content-Type": "application/json"},
-    )
+    """在 E2B 沙盒里执行代码，返回输出。"""
+    lang = language.lower().strip()
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            result = json.loads(r.read().decode("utf-8"))
+        sb = _get_sandbox()
+
+        # Python 直接用 run_code
+        if lang in ("python", "python3", "py"):
+            execution = sb.run_code(code)
+            output = []
+            # rich results（图表数据等）
+            for result in (execution.results or []):
+                if hasattr(result, "text") and result.text:
+                    output.append(result.text)
+            # stdout / stderr
+            if execution.logs.stdout:
+                output.append("".join(execution.logs.stdout))
+            if execution.logs.stderr:
+                output.append("[stderr]\n" + "".join(execution.logs.stderr))
+            if execution.error:
+                output.append(f"[错误] {execution.error.name}: {execution.error.value}")
+            return "\n".join(output).strip() or "[运行成功，无输出]"
+
+        # 其他语言：通过 Python subprocess 在沙盒里跑
+        ext_map = {
+            "javascript": "js", "js": "js", "node": "js",
+            "typescript": "ts", "ts": "ts",
+            "bash": "sh",  "sh": "sh",
+            "ruby": "rb",  "rb": "rb",
+            "go": "go",
+            "rust": "rs",  "rs": "rs",
+        }
+        runner_map = {
+            "js": "node", "ts": "npx ts-node",
+            "sh": "bash",
+            "rb": "ruby",
+            "go": "go run",
+            "rs": "rustc -o /tmp/prog && /tmp/prog",
+        }
+        ext    = ext_map.get(lang, lang)
+        runner = runner_map.get(ext, lang)
+
+        wrapper = f"""
+import subprocess, tempfile, os, sys
+code = {repr(code)}
+with tempfile.NamedTemporaryFile(suffix='.{ext}', mode='w', delete=False) as f:
+    f.write(code)
+    fname = f.name
+try:
+    result = subprocess.run(
+        '{runner} ' + fname, shell=True,
+        input={repr(stdin)}, capture_output=True, text=True, timeout=30
+    )
+    print(result.stdout, end='')
+    if result.stderr: print('[stderr]', result.stderr, end='')
+finally:
+    os.unlink(fname)
+"""
+        execution = sb.run_code(wrapper)
+        output = []
+        if execution.logs.stdout:
+            output.append("".join(execution.logs.stdout))
+        if execution.logs.stderr:
+            output.append("".join(execution.logs.stderr))
+        if execution.error:
+            output.append(f"[错误] {execution.error.name}: {execution.error.value}")
+        return "\n".join(output).strip() or "[运行成功，无输出]"
+
     except Exception as e:
         return f"[执行失败: {e}]"
 
-    run    = result.get("run", {})
-    stdout = (run.get("stdout") or "").strip()
-    stderr = (run.get("stderr") or "").strip()
-    code_  = run.get("code")
-
-    if stderr and not stdout:
-        return f"[错误]\n{stderr}"
-    if stderr:
-        return f"{stdout}\n[stderr]\n{stderr}"
-    if stdout:
-        return stdout
-    if code_ == 0:
-        return "[运行成功，无输出]"
-    return f"[退出码 {code_}，无输出]"
+def install_package(package: str) -> str:
+    """在沙盒里 pip install 一个包。"""
+    try:
+        sb = _get_sandbox()
+        execution = sb.run_code(f"import subprocess; r = subprocess.run(['pip', 'install', '{package}', '-q'], capture_output=True, text=True); print(r.stdout[-500:] if r.stdout else ''); print(r.stderr[-200:] if r.stderr else '')")
+        out = "".join(execution.logs.stdout or []).strip()
+        return out or f"[{package} 安装完成]"
+    except Exception as e:
+        return f"[安装失败: {e}]"
 
 # ---------------------------------------------------------------------------
-# 工具定义（喂给模型的 tools 列表）
+# 工具定义
 # ---------------------------------------------------------------------------
 TOOLS = [
     {
@@ -190,41 +220,51 @@ TOOLS = [
         "function": {
             "name": "execute_code",
             "description": (
-                "在沙盒里执行代码并返回输出。支持 python / javascript / typescript / "
-                "bash / ruby / go / rust / c++ / c / java。"
-                "适合帮对方算数、跑脚本、验证逻辑、生成数据等。"
+                "在云端沙盒里执行代码并返回输出。"
+                "沙盒有网络，可以 import 包、爬数据、调 API。"
+                "支持 python / javascript / bash / ruby / go / rust。"
+                "同一次对话共用同一个沙盒，变量和文件会保留。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "language": {
-                        "type": "string",
-                        "description": "编程语言，如 python / javascript / bash"
-                    },
-                    "code": {
-                        "type": "string",
-                        "description": "要执行的代码"
-                    },
-                    "stdin": {
-                        "type": "string",
-                        "description": "可选的标准输入"
-                    }
+                    "language": {"type": "string", "description": "编程语言，如 python / javascript / bash"},
+                    "code":     {"type": "string", "description": "要执行的代码"},
+                    "stdin":    {"type": "string", "description": "可选标准输入"},
                 },
-                "required": ["language", "code"]
-            }
-        }
-    }
+                "required": ["language", "code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "install_package",
+            "description": "在沙盒里 pip install 一个 Python 包，安装后当次对话即可 import。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "package": {"type": "string", "description": "包名，如 requests / pandas / numpy"},
+                },
+                "required": ["package"],
+            },
+        },
+    },
 ]
 
 def _dispatch_tool(name: str, args: dict) -> str:
     if name == "execute_code":
-        lang   = args.get("language", "python")
-        code   = args.get("code", "")
-        stdin  = args.get("stdin", "")
-        log("tool", f"execute_code [{lang}] {code[:60].replace(chr(10),' ')}…")
+        lang  = args.get("language", "python")
+        code  = args.get("code", "")
+        stdin = args.get("stdin", "")
+        log("tool", f"execute_code [{lang}] {code[:60].replace(chr(10), ' ')}…")
         result = execute_code(lang, code, stdin)
-        log("tool", f"结果: {result[:80].replace(chr(10),' ')}")
+        log("tool", f"结果: {result[:120].replace(chr(10), ' ')}")
         return result
+    if name == "install_package":
+        pkg = args.get("package", "")
+        log("tool", f"install_package {pkg}")
+        return install_package(pkg)
     return f"[未知工具: {name}]"
 
 # ---------------------------------------------------------------------------
@@ -258,28 +298,24 @@ def build_messages() -> list:
     return [{"role": "system", "content": PERSONA}] + list(convo)
 
 # ---------------------------------------------------------------------------
-# 调模型（带工具循环，最多 6 步）
+# 调模型（带工具循环，最多 8 步）
 # ---------------------------------------------------------------------------
 def _one_call(route: dict, messages: list) -> str:
-    body = {
-        "model":       route["model"],
-        "messages":    messages,
-        "temperature": TEMPERATURE,
-        "tools":       TOOLS,
-        "tool_choice": "auto",
-    }
-    headers = {
-        "Authorization": f"Bearer {route['key']}",
-        "Content-Type":  "application/json",
-    }
-
+    headers    = {"Authorization": f"Bearer {route['key']}", "Content-Type": "application/json"}
     local_msgs = list(messages)
-    for step in range(6):  # 最多循环 6 步，防止无限套娃
-        data = json.dumps(body | {"messages": local_msgs},
-                          ensure_ascii=False).encode("utf-8")
-        req  = urllib.request.Request(
+
+    for step in range(8):
+        body = json.dumps({
+            "model":       route["model"],
+            "messages":    local_msgs,
+            "temperature": TEMPERATURE,
+            "tools":       TOOLS,
+            "tool_choice": "auto",
+        }, ensure_ascii=False).encode("utf-8")
+
+        req = urllib.request.Request(
             route["base"] + "/chat/completions",
-            data=data, method="POST", headers=headers,
+            data=body, method="POST", headers=headers,
         )
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
             resp = json.loads(r.read().decode("utf-8"))
@@ -288,11 +324,9 @@ def _one_call(route: dict, messages: list) -> str:
         message = choice["message"]
         finish  = choice.get("finish_reason", "")
 
-        # 没有工具调用 → 直接返回文本
         if finish != "tool_calls" and not message.get("tool_calls"):
             return (message.get("content") or "").strip()
 
-        # 有工具调用 → 执行，把结果喂回
         local_msgs.append(message)
         for tc in (message.get("tool_calls") or []):
             fn_name = tc["function"]["name"]
@@ -303,10 +337,8 @@ def _one_call(route: dict, messages: list) -> str:
                 "tool_call_id": tc["id"],
                 "content":      result,
             })
-        body["messages"] = local_msgs
 
-    # 超出步数，拿最后一条文本兜底
-    return (message.get("content") or "（执行超步数）").strip()
+    return (message.get("content") or "（超出步数）").strip()
 
 def call_llm(messages: list) -> str:
     last_err = None
@@ -368,8 +400,7 @@ def stream_inbound(cursor: int) -> None:
     while True:
         try:
             url = f"{RELAY_URL}/channel/in?since={cursor}"
-            req = urllib.request.Request(
-                url, headers={**_auth(), "Accept": "text/event-stream"})
+            req = urllib.request.Request(url, headers={**_auth(), "Accept": "text/event-stream"})
             with urllib.request.urlopen(req, timeout=90) as resp:
                 log("in", f"stream connected (since={cursor})")
                 backoff     = 1
@@ -405,7 +436,12 @@ def stream_inbound(cursor: int) -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     _require_config()
-    log("boot", f"relay={RELAY_URL} models={[r['model'] for r in MODEL_ROUTES]}")
+    log("boot", f"relay={RELAY_URL} models={[r['model'] for r in MODEL_ROUTES]} e2b=✓")
+    # 预热沙盒
+    try:
+        _get_sandbox()
+    except Exception as e:
+        log("e2b", f"沙盒预热失败: {e}，将在首次使用时重试")
     cursor = read_cursor()
     try:
         ctx, max_id = load_history()
