@@ -126,7 +126,8 @@ def _get_sandbox():
             _sandbox = None
 
     from e2b_code_interpreter import Sandbox
-    _sandbox = Sandbox(api_key=E2B_API_KEY, timeout=3600)
+   os.environ["E2B_API_KEY"] = E2B_API_KEY
+_sandbox = Sandbox(timeout=3600)
     log("e2b", f"沙盒已创建: {_sandbox.sandbox_id}")
     return _sandbox
 
