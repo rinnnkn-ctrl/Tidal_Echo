@@ -1,1 +1,2 @@
-# no dependencies
+e2b-code-interpreter
+
