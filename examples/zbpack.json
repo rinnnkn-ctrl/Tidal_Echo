@@ -1,0 +1,4 @@
+{
+  "build_command": "pip install -r requirements.txt || true",
+  "start_command": "python3 bridge_any_llm.py"
+}
